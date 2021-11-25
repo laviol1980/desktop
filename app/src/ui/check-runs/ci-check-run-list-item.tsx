@@ -1,8 +1,5 @@
 import * as React from 'react'
-import {
-  getCheckRunDisplayName,
-  IRefCheck,
-} from '../../lib/ci-checks/ci-checks'
+import { IRefCheck } from '../../lib/ci-checks/ci-checks'
 import { Octicon } from '../octicons'
 import { getClassNameForCheck, getSymbolForCheck } from '../branches/ci-status'
 import classNames from 'classnames'
@@ -24,9 +21,6 @@ interface ICICheckRunListItemProps {
 
   /** Whether to show the logs for this check run */
   readonly isCheckRunExpanded: boolean
-
-  /** Whether or not to show the action workflow event in the title */
-  readonly showEventInTitle: boolean
 
   /** Whether the list item can be selected */
   readonly selectable: boolean
@@ -100,8 +94,7 @@ export class CICheckRunListItem extends React.PureComponent<
   }
 
   private renderCheckRunName = (): JSX.Element => {
-    const { checkRun } = this.props
-    const name = getCheckRunDisplayName(checkRun, this.props.showEventInTitle)
+    const { name, description } = this.props.checkRun
     return (
       <div className="ci-check-list-item-detail">
         <TooltippedContent
@@ -114,7 +107,7 @@ export class CICheckRunListItem extends React.PureComponent<
           <span onClick={this.onViewCheckExternally}>{name}</span>
         </TooltippedContent>
 
-        <div className="ci-check-description">{checkRun.description}</div>
+        <div className="ci-check-description">{description}</div>
       </div>
     )
   }
@@ -122,14 +115,16 @@ export class CICheckRunListItem extends React.PureComponent<
   public render() {
     const { checkRun, isCheckRunExpanded } = this.props
 
+    const classes = classNames('ci-check-list-item', 'list-item', {
+      sticky: isCheckRunExpanded,
+      selected: this.props.selected,
+    })
     return (
-      <>
+      <div className="ci-check-list-item-group">
         <div
-          className={classNames('ci-check-list-item list-item', {
-            selected: this.props.selected,
-          })}
-          tabIndex={0}
+          className={classes}
           onClick={this.toggleCheckRunExpansion}
+          tabIndex={0}
         >
           {this.renderCheckStatusSymbol()}
           {this.renderCheckRunName()}
@@ -141,7 +136,7 @@ export class CICheckRunListItem extends React.PureComponent<
             onViewJobStep={this.onViewJobStep}
           />
         ) : null}
-      </>
+      </div>
     )
   }
 }
