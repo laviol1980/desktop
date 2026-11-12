@@ -1,16 +1,14 @@
 import * as Path from 'path'
-import fileUrl from 'file-url'
-import { realpath } from 'fs-extra'
+import { realpath } from 'fs/promises'
+import { pathToFileURL } from 'url'
 
 /**
  * Resolve and encode the path information into a URL.
  *
  * @param pathSegments array of path segments to resolve
  */
-export function encodePathAsUrl(...pathSegments: string[]): string {
-  const path = Path.resolve(...pathSegments)
-  return fileUrl(path)
-}
+export const encodePathAsUrl = (...pathSegments: string[]) =>
+  pathToFileURL(Path.resolve(...pathSegments)).toString()
 
 /**
  * Resolve one or more path sequences into an absolute path underneath
@@ -32,7 +30,7 @@ export function encodePathAsUrl(...pathSegments: string[]): string {
  * @param options      A subset of the Path module. Requires the join,
  *                     resolve, and normalize path functions. Defaults
  *                     to the platform specific path functions but can
- *                     be overriden by providing either Path.win32 or
+ *                     be overridden by providing either Path.win32 or
  *                     Path.posix
  */
 async function _resolveWithin(

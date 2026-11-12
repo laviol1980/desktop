@@ -46,7 +46,7 @@ interface IDBMentionableUser extends IMentionableUser {
 export interface IMentionableCacheEntry {
   readonly gitHubRepositoryID: number
   /**
-   * The time (in milliseconds since the epoc) that
+   * The time (in milliseconds since the epoch) that
    * the mentionable users was last updated for this
    * repository
    */
@@ -60,8 +60,8 @@ export interface IMentionableCacheEntry {
 }
 
 export class GitHubUserDatabase extends BaseDatabase {
-  public mentionables!: Dexie.Table<IDBMentionableUser, number>
-  public mentionableCache!: Dexie.Table<IMentionableCacheEntry, number>
+  public declare mentionables: Dexie.Table<IDBMentionableUser, number>
+  public declare mentionableCache: Dexie.Table<IMentionableCacheEntry, number>
 
   public constructor(name: string, schemaVersion?: number) {
     super(name, schemaVersion)

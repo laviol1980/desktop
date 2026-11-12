@@ -1,13 +1,15 @@
+import { describe, it } from 'node:test'
+import assert from 'node:assert'
 import {
   groupRepositories,
   YourRepositoriesIdentifier,
 } from '../../src/ui/clone-repository/group-repositories'
-import { IAPIRepository, IAPIIdentity } from '../../src/lib/api'
+import { IAPIIdentity, IAPIFullRepository } from '../../src/lib/api'
 
 const users = {
   shiftkey: {
     id: 1,
-    url: '',
+    html_url: '',
     login: 'shiftkey',
     avatar_url: '',
     name: 'Brendan Forster',
@@ -15,7 +17,7 @@ const users = {
   } as IAPIIdentity,
   desktop: {
     id: 2,
-    url: '',
+    html_url: '',
     login: 'desktop',
     avatar_url: '',
     name: 'Desktop',
@@ -23,7 +25,7 @@ const users = {
   } as IAPIIdentity,
   octokit: {
     id: 3,
-    url: '',
+    html_url: '',
     login: 'octokit',
     avatar_url: '',
     name: 'Octokit',
@@ -32,8 +34,8 @@ const users = {
 }
 
 describe('clone repository grouping', () => {
-  it('groups repositories by organization', () => {
-    const repositories: Array<IAPIRepository> = [
+  it('groups repositories by owner', () => {
+    const repositories: Array<IAPIFullRepository> = [
       {
         clone_url: '',
         ssh_url: '',
@@ -51,6 +53,7 @@ describe('clone repository grouping', () => {
           push: true,
           admin: false,
         },
+        parent: undefined,
       },
       {
         clone_url: '',
@@ -69,6 +72,7 @@ describe('clone repository grouping', () => {
           push: true,
           admin: false,
         },
+        parent: undefined,
       },
       {
         clone_url: '',
@@ -87,29 +91,30 @@ describe('clone repository grouping', () => {
           push: true,
           admin: false,
         },
+        parent: undefined,
       },
     ]
 
     const grouped = groupRepositories(repositories, 'shiftkey')
-    expect(grouped).toHaveLength(3)
+    assert.equal(grouped.length, 3)
 
-    expect(grouped[0].identifier).toBe(YourRepositoriesIdentifier)
-    expect(grouped[0].items).toHaveLength(1)
+    assert.equal(grouped[0].identifier, YourRepositoriesIdentifier)
+    assert.equal(grouped[0].items.length, 1)
 
     let item = grouped[0].items[0]
-    expect(item.name).toBe('some-repo')
+    assert.equal(item.name, 'some-repo')
 
-    expect(grouped[1].identifier).toBe('desktop')
-    expect(grouped[1].items).toHaveLength(1)
+    assert.equal(grouped[1].identifier, 'desktop')
+    assert.equal(grouped[1].items.length, 1)
 
     item = grouped[1].items[0]
-    expect(item.name).toBe('desktop')
+    assert.equal(item.name, 'desktop')
 
     item = grouped[2].items[0]
-    expect(grouped[2].identifier).toBe('octokit')
-    expect(grouped[2].items).toHaveLength(1)
+    assert.equal(grouped[2].identifier, 'octokit')
+    assert.equal(grouped[2].items.length, 1)
 
     item = grouped[2].items[0]
-    expect(item.name).toBe('octokit.net')
+    assert.equal(item.name, 'octokit.net')
   })
 })

@@ -1,7 +1,7 @@
 import * as Path from 'path'
 
 import { Account } from '../../../models/account'
-import { writeFile, pathExists, ensureDir } from 'fs-extra'
+import { mkdir, writeFile } from 'fs/promises'
 import { API } from '../../api'
 import { APIError } from '../../http'
 import {
@@ -9,12 +9,13 @@ import {
   PushProgressParser,
 } from '../../progress'
 import { git } from '../../git'
-import { friendlyEndpointName } from '../../friendly-endpoint-name'
 import { IRemote } from '../../../models/remote'
+import { getDefaultBranch } from '../../helpers/default-branch'
 import { envForRemoteOperation } from '../../git/environment'
+import { pathExists } from '../../path-exists'
 
 const nl = __WIN32__ ? '\r\n' : '\n'
-const InititalReadmeContents =
+const InitialReadmeContents =
   `# Welcome to GitHub Desktop!${nl}${nl}` +
   `This is your README. READMEs are where you can communicate ` +
   `what your project is and how to use it.${nl}${nl}` +
@@ -46,9 +47,7 @@ async function createAPIRepository(account: Account, name: string) {
         ) {
           throw new Error(
             'You already have a repository named ' +
-              `"${name}" on your account at ${friendlyEndpointName(
-                account
-              )}.\n\n` +
+              `"${name}" on your account at ${account.friendlyEndpoint}.\n\n` +
               'Please delete the repository and try again.'
           )
         }
@@ -63,14 +62,18 @@ async function pushRepo(
   path: string,
   account: Account,
   remote: IRemote,
+  remoteBranchName: string,
   progressCb: (title: string, value: number, description?: string) => void
 ) {
-  const pushTitle = `Pushing repository to ${friendlyEndpointName(account)}`
+  const pushTitle = `Pushing repository to ${account.friendlyEndpoint}`
   progressCb(pushTitle, 0)
 
   const pushOpts = await executionOptionsWithProgress(
     {
-      env: await envForRemoteOperation(account, remote.url),
+      env: await envForRemoteOperation(remote.url),
+      // The tutorial repository isn't added to Desktop until after it's been
+      // pushed, so its account can't be resolved from its path yet.
+      fallbackAccount: { endpoint: account.endpoint, login: account.login },
     },
     new PushProgressParser(),
     progress => {
@@ -80,7 +83,7 @@ async function pushRepo(
     }
   )
 
-  const args = ['push', '-u', remote.name, 'master']
+  const args = ['push', '-u', remote.name, remoteBranchName]
   await git(args, path, 'tutorial:push', pushOpts)
 }
 
@@ -102,8 +105,7 @@ export async function createTutorialRepository(
   path: string,
   progressCb: (title: string, value: number, description?: string) => void
 ) {
-  const endpointName = friendlyEndpointName(account)
-  progressCb(`Creating repository on ${endpointName}`, 0)
+  progressCb(`Creating repository on ${account.friendlyEndpoint}`, 0)
 
   if (await pathExists(path)) {
     throw new Error(
@@ -113,30 +115,30 @@ export async function createTutorialRepository(
   }
 
   const repo = await createAPIRepository(account, name)
-
+  const branch = repo.default_branch ?? (await getDefaultBranch())
   progressCb('Initializing local repository', 0.2)
 
-  await ensureDir(path)
-  await git(['init'], path, 'tutorial:init')
+  await mkdir(path, { recursive: true })
 
-  await writeFile(Path.join(path, 'README.md'), InititalReadmeContents)
-
-  await git(['add', '--', 'README.md'], path, 'tutorial:add')
   await git(
-    ['commit', '-m', 'Initial commit', '--', 'README.md'],
+    ['-c', `init.defaultBranch=${branch}`, 'init'],
     path,
-    'tutorial:commit'
+    'tutorial:init'
   )
 
-  const remote: IRemote = { name: 'origin', url: repo.clone_url }
+  await writeFile(Path.join(path, 'README.md'), InitialReadmeContents)
 
+  await git(['add', '--', 'README.md'], path, 'tutorial:add')
+  await git(['commit', '-m', 'Initial commit'], path, 'tutorial:commit')
+
+  const remote: IRemote = { name: 'origin', url: repo.clone_url }
   await git(
     ['remote', 'add', remote.name, remote.url],
     path,
     'tutorial:add-remote'
   )
 
-  await pushRepo(path, account, remote, (title, value, description) => {
+  await pushRepo(path, account, remote, branch, (title, value, description) => {
     progressCb(title, 0.3 + value * 0.6, description)
   })
 

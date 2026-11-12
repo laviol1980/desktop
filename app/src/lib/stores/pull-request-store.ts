@@ -49,34 +49,23 @@ export class PullRequestStore {
 
   /** Loads all pull requests against the given repository. */
   public refreshPullRequests(repo: GitHubRepository, account: Account) {
-    const dbId = repo.dbID
-
-    if (dbId === null) {
-      // This can happen when the `repositoryWithRefreshedGitHubRepository`
-      // method in AppStore fails to retrieve API information about the current
-      // repository either due to the user being signed out or the API failing
-      // to provide a response. There's nothing for us to do when that happens
-      // so instead of crashing we'll bail here.
-      return Promise.resolve()
-    }
-
-    const currentOp = this.currentRefreshOperations.get(dbId)
+    const currentOp = this.currentRefreshOperations.get(repo.dbID)
 
     if (currentOp !== undefined) {
       return currentOp
     }
 
-    this.lastRefreshForRepository.set(dbId, Date.now())
+    this.lastRefreshForRepository.set(repo.dbID, Date.now())
 
     const promise = this.fetchAndStorePullRequests(repo, account)
       .catch(err => {
         log.error(`Error refreshing pull requests for '${repo.fullName}'`, err)
       })
       .then(() => {
-        this.currentRefreshOperations.delete(dbId)
+        this.currentRefreshOperations.delete(repo.dbID)
       })
 
-    this.currentRefreshOperations.set(dbId, promise)
+    this.currentRefreshOperations.set(repo.dbID, promise)
     return promise
   }
 
@@ -169,15 +158,6 @@ export class PullRequestStore {
 
   /** Gets all stored pull requests for the given repository. */
   public async getAll(repository: GitHubRepository) {
-    if (repository.dbID === null) {
-      // This can happen when the `repositoryWithRefreshedGitHubRepository`
-      // method in AppStore fails to retrieve API information about the current
-      // repository either due to the user being signed out or the API failing
-      // to provide a response. There's nothing for us to do when that happens
-      // so instead of crashing we'll bail here.
-      return []
-    }
-
     const records = await this.db.getAllPullRequestsInRepository(repository)
     const result = new Array<PullRequest>()
 
@@ -214,7 +194,8 @@ export class PullRequestStore {
           new PullRequestRef(record.head.ref, record.head.sha, headRepository),
           new PullRequestRef(record.base.ref, record.base.sha, baseRepository),
           record.author,
-          record.draft ?? false
+          record.draft ?? false,
+          record.body
         )
       )
     }
@@ -262,8 +243,6 @@ export class PullRequestStore {
     const prsToDelete = new Array<PullRequestKey>()
     const prsToUpsert = new Array<IPullRequest>()
 
-    // The API endpoint for this PR, i.e api.github.com or a GHE url
-    const { endpoint } = repository
     const store = this.repositoryStore
 
     // Upsert will always query the database for a repository. Given that
@@ -272,17 +251,20 @@ export class PullRequestStore {
     // to use the upsert just to ensure that the repo exists in the database
     // and reuse the same object without going to the database for all that
     // follow.
-    const upsertRepo = mem(store.upsertGitHubRepository.bind(store), {
-      // The first argument which we're ignoring here is the endpoint
-      // which is constant throughout the lifetime of this function.
-      // The second argument is an `IAPIRepository` which is basically
-      // the raw object that we got from the API which could consist of
-      // more than just the fields we've modelled in the interface. The
-      // only thing we really care about to determine whether the
-      // repository has already been inserted in the database is the clone
-      // url since that's what the upsert method uses as its key.
-      cacheKey: (_, repo) => repo.clone_url,
-    })
+    const upsertRepo = mem(
+      store.upsertGitHubRepositoryLightForRepository.bind(store),
+      {
+        // The first argument is the account-qualified repository context,
+        // which is constant throughout the lifetime of this function.
+        // The second argument is an `IAPIRepository` which is basically
+        // the raw object that we got from the API which could consist of
+        // more than just the fields we've modelled in the interface. The
+        // only thing we really care about to determine whether the
+        // repository has already been inserted in the database is the clone
+        // url since that's what the upsert method uses as its key.
+        cacheKey: (_, repo) => repo.clone_url,
+      }
+    )
 
     for (const pr of pullRequestsFromAPI) {
       // We can do this string comparison here rather than convert to date
@@ -297,11 +279,7 @@ export class PullRequestStore {
         return fatalError('PR cannot have a null base repo')
       }
 
-      const baseGitHubRepo = await upsertRepo(endpoint, pr.base.repo)
-
-      if (baseGitHubRepo.dbID === null) {
-        return fatalError('PR cannot have a null parent database id')
-      }
+      const baseGitHubRepo = await upsertRepo(repository, pr.base.repo)
 
       if (pr.state === 'closed') {
         prsToDelete.push(getPullRequestKey(baseGitHubRepo, pr.number))
@@ -323,11 +301,7 @@ export class PullRequestStore {
         continue
       }
 
-      const headRepo = await upsertRepo(endpoint, pr.head.repo)
-
-      if (headRepo.dbID === null) {
-        return fatalError('PR cannot have non-existent repo')
-      }
+      const headRepo = await upsertRepo(repository, pr.head.repo)
 
       prsToUpsert.push({
         number: pr.number,
@@ -344,6 +318,7 @@ export class PullRequestStore {
           sha: pr.base.sha,
           repoId: baseGitHubRepo.dbID,
         },
+        body: pr.body,
         author: pr.user.login,
         draft: pr.draft ?? false,
       })

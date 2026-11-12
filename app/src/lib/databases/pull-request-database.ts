@@ -1,7 +1,6 @@
 import Dexie from 'dexie'
 import { BaseDatabase } from './base-database'
 import { GitHubRepository } from '../../models/github-repository'
-import { fatalError, forceUnwrap } from '../fatal-error'
 
 export interface IPullRequestRef {
   /**
@@ -24,6 +23,9 @@ export interface IPullRequest {
   /** The title. */
   readonly title: string
 
+  /** The body of the PR - This is markdown. */
+  readonly body: string
+
   /** The string formatted date on which the PR was created. */
   readonly createdAt: string
 
@@ -33,7 +35,7 @@ export interface IPullRequest {
   /** The ref from which the pull request's changes are coming. */
   readonly head: IPullRequestRef
 
-  /** The ref which the pull request is targetting. */
+  /** The ref which the pull request is targeting. */
   readonly base: IPullRequestRef
 
   /** The login of the author. */
@@ -75,8 +77,11 @@ interface IPullRequestsLastUpdated {
 export type PullRequestKey = [number, number]
 
 export class PullRequestDatabase extends BaseDatabase {
-  public pullRequests!: Dexie.Table<IPullRequest, PullRequestKey>
-  public pullRequestsLastUpdated!: Dexie.Table<IPullRequestsLastUpdated, number>
+  public declare pullRequests: Dexie.Table<IPullRequest, PullRequestKey>
+  public declare pullRequestsLastUpdated: Dexie.Table<
+    IPullRequestsLastUpdated,
+    number
+  >
 
   public constructor(name: string, schemaVersion?: number) {
     super(name, schemaVersion)
@@ -126,6 +131,15 @@ export class PullRequestDatabase extends BaseDatabase {
       tx.table('pullRequests').clear()
       tx.table('pullRequestsLastUpdated').clear()
     })
+
+    this.conditionalVersion(9, {}, async tx => {
+      /**
+       * We're introducing the `body` property on PRs in version 8 in order
+       * to be able to display the body of the pr.
+       */
+      tx.table('pullRequests').clear()
+      tx.table('pullRequestsLastUpdated').clear()
+    })
   }
 
   /**
@@ -134,11 +148,6 @@ export class PullRequestDatabase extends BaseDatabase {
    * if it exists.
    */
   public async deleteAllPullRequestsInRepository(repository: GitHubRepository) {
-    const dbId = forceUnwrap(
-      "Can't delete PRs for repository, no dbId",
-      repository.dbID
-    )
-
     await this.transaction(
       'rw',
       this.pullRequests,
@@ -147,7 +156,7 @@ export class PullRequestDatabase extends BaseDatabase {
         await this.clearLastUpdated(repository)
         await this.pullRequests
           .where('[base.repoId+number]')
-          .between([dbId], [dbId + 1])
+          .between([repository.dbID], [repository.dbID + 1])
           .delete()
       }
     )
@@ -180,10 +189,6 @@ export class PullRequestDatabase extends BaseDatabase {
    * yet been inserted into the database (i.e the dbID field is null).
    */
   public getAllPullRequestsInRepository(repository: GitHubRepository) {
-    if (repository.dbID === null) {
-      return fatalError("Can't retrieve PRs for repository, no dbId")
-    }
-
     return this.pullRequests
       .where('[base.repoId+number]')
       .between([repository.dbID], [repository.dbID + 1])
@@ -194,10 +199,6 @@ export class PullRequestDatabase extends BaseDatabase {
    * Get a single pull requests for a particular repository
    */
   public getPullRequest(repository: GitHubRepository, prNumber: number) {
-    if (repository.dbID === null) {
-      return fatalError("Can't retrieve PRs for repository with a null dbID")
-    }
-
     return this.pullRequests.get([repository.dbID, prNumber])
   }
 
@@ -212,10 +213,6 @@ export class PullRequestDatabase extends BaseDatabase {
    * table.
    */
   public async getLastUpdated(repository: GitHubRepository) {
-    if (repository.dbID === null) {
-      return fatalError("Can't retrieve PRs for repository with a null dbID")
-    }
-
     const row = await this.pullRequestsLastUpdated.get(repository.dbID)
 
     return row ? new Date(row.lastUpdated) : null
@@ -226,12 +223,6 @@ export class PullRequestDatabase extends BaseDatabase {
    * a given repository.
    */
   public async clearLastUpdated(repository: GitHubRepository) {
-    if (repository.dbID === null) {
-      throw new Error(
-        "Can't clear last updated PR for repository with a null dbID"
-      )
-    }
-
     await this.pullRequestsLastUpdated.delete(repository.dbID)
   }
 
@@ -246,10 +237,6 @@ export class PullRequestDatabase extends BaseDatabase {
    * table.
    */
   public async setLastUpdated(repository: GitHubRepository, lastUpdated: Date) {
-    if (repository.dbID === null) {
-      throw new Error("Can't set last updated for PR with a null dbID")
-    }
-
     await this.pullRequestsLastUpdated.put({
       repoId: repository.dbID,
       lastUpdated: lastUpdated.getTime(),
@@ -271,9 +258,5 @@ export function getPullRequestKey(
   repository: GitHubRepository,
   prNumber: number
 ) {
-  const dbId = forceUnwrap(
-    `Can get key for PR, repository not inserted in database.`,
-    repository.dbID
-  )
-  return [dbId, prNumber] as PullRequestKey
+  return [repository.dbID, prNumber] as PullRequestKey
 }

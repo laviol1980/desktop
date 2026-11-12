@@ -8,7 +8,7 @@ interface IAccessTextProps {
    * highlighted when the highlight property is set. Literal ampersand
    * characters need to be escaped by using two ampersand characters (&&).
    *
-   * At most one character is allowed to have a preceeding ampersand character.
+   * At most one character is allowed to have a preceding ampersand character.
    */
   readonly text: string
 
@@ -78,6 +78,11 @@ export class AccessText extends React.Component<IAccessTextProps, {}> {
 
     const plainText = `${preText}${accessKeyText}${postText}`
 
-    return <span aria-label={plainText}>{elements}</span>
+    return (
+      <span>
+        <span className="sr-only">{plainText}</span>
+        {elements}
+      </span>
+    )
   }
 }

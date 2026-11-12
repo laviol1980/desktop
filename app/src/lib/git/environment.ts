@@ -1,9 +1,11 @@
 import { envForAuthentication } from './authentication'
-import { IGitAccount } from '../../models/git-account'
-import { enableAutomaticGitProxyConfiguration } from '../feature-flag'
 import { resolveGitProxy } from '../resolve-git-proxy'
-import { getDotComAPIEndpoint } from '../api'
-import { Repository } from '../../models/repository'
+import { getHTMLURL } from '../api'
+import {
+  Repository,
+  isRepositoryWithGitHubRepository,
+} from '../../models/repository'
+import { IRemote } from '../../models/remote'
 
 /**
  * For many remote operations it's well known what the primary remote
@@ -18,25 +20,34 @@ import { Repository } from '../../models/repository'
  * be on a different server as well. That's too advanced for our usage
  * at the moment though so we'll just need to figure out some reasonable
  * url to fall back on.
+ *
+ * @param branchName If the operation we're about to undertake is related to a
+ *                   local ref (i.e branch) then we can use that to resolve its
+ *                   upstream tracking branch (and thereby its remote) and use
+ *                   that as the probable url to resolve a proxy for.
  */
 export function getFallbackUrlForProxyResolve(
-  account: IGitAccount | null,
-  repository: Repository
+  repository: Repository,
+  currentRemote: IRemote | null
 ) {
-  // If we've got an account with an endpoint that means we've already done the
-  // heavy lifting to figure out what the most likely endpoint is gonna be
-  // so we'll try to leverage that.
-  if (account !== null) {
-    // A GitHub.com Account will have api.github.com as its endpoint
-    return account.endpoint === getDotComAPIEndpoint()
-      ? 'https://github.com'
-      : account.endpoint
+  // We used to use account.endpoint here but we look up account by the
+  // repository endpoint (see getAccountForRepository) so we can skip the use
+  // of the account here and just use the repository endpoint directly.
+  if (isRepositoryWithGitHubRepository(repository)) {
+    return getHTMLURL(repository.gitHubRepository.endpoint)
   }
 
-  if (repository.gitHubRepository !== null) {
-    if (repository.gitHubRepository.cloneURL !== null) {
-      return repository.gitHubRepository.cloneURL
-    }
+  // This is a carry-over from the old code where we would use the current
+  // remote to resolve an account and then use that account's endpoint here.
+  // We've since removed the need to pass an account down here but unfortunately
+  // that means we need to pass the current remote instead. Note that ideally
+  // this should be looking up the remote url either based on the currently
+  // checked out branch, the upstream tracking branch of the branch being
+  // checked out, or the default remote if neither of those are available.
+  // Doing so by shelling out to Git here was deemed to costly and in order to
+  // finish this refactor we've opted to replicate the previous behavior here.
+  if (currentRemote) {
+    return currentRemote.url
   }
 
   // If all else fails let's assume that whatever network resource
@@ -54,20 +65,17 @@ export function getFallbackUrlForProxyResolve(
  * authentication, and resolving proxy urls if necessary.
  *
  * @param account   The authentication information (if available) to provide
- *                  to Git for use when connectingt to the remote
+ *                  to Git for use when connecting to the remote
  * @param remoteUrl The primary remote URL for this operation. Note that Git
  *                  might connect to other remotes in order to fulfill the
  *                  operation. As an example, a clone of
- *                  https://github.com/desktop/desktop could containt a submodule
+ *                  https://github.com/desktop/desktop could contain a submodule
  *                  pointing to another host entirely. Used to resolve which
  *                  proxy (if any) should be used for the operation.
  */
-export async function envForRemoteOperation(
-  account: IGitAccount | null,
-  remoteUrl: string
-) {
+export async function envForRemoteOperation(remoteUrl: string) {
   return {
-    ...envForAuthentication(account),
+    ...envForAuthentication(),
     ...(await envForProxy(remoteUrl)),
   }
 }
@@ -86,10 +94,19 @@ export async function envForProxy(
   remoteUrl: string,
   env: NodeJS.ProcessEnv = process.env,
   resolve: (url: string) => Promise<string | undefined> = resolveGitProxy
-): Promise<NodeJS.ProcessEnv | undefined> {
-  if (!enableAutomaticGitProxyConfiguration()) {
-    return undefined
+): Promise<Record<string, string | undefined> | undefined> {
+  const protocolMatch = /^(https?):\/\//i.exec(remoteUrl)
+
+  // We can only resolve and use a proxy for the protocols where cURL
+  // would be involved (i.e http and https). git:// relies on ssh.
+  if (protocolMatch === null) {
+    return
   }
+
+  // Note that HTTPS here doesn't mean that the proxy is HTTPS, only
+  // that all requests to HTTPS protocols should be proxied. The
+  // proxy protocol is defined by the url returned by `this.resolve()`
+  const proto = protocolMatch[1].toLowerCase() // http or https
 
   // We'll play it safe and say that if the user has configured
   // the ALL_PROXY environment variable they probably know what
@@ -101,20 +118,6 @@ export async function envForProxy(
     log.info(`proxy url not resolved, ALL_PROXY already set`)
     return
   }
-
-  const protocolMatch = /^(https?):\/\//i.exec(remoteUrl)
-
-  // We can only resolve and use a proxy for the protocols where cURL
-  // would be involved (i.e http and https). git:// relies on ssh.
-  if (protocolMatch === null) {
-    log.info(`proxy url not resolved, protocol not supported`)
-    return
-  }
-
-  // Note that HTTPS here doesn't mean that the proxy is HTTPS, only
-  // that all requests to HTTPS protocols should be proxied. The
-  // proxy protocol is defined by the url returned by `this.resolve()`
-  const proto = protocolMatch[1].toLowerCase() // http or https
 
   // Lower case environment variables due to
   // https://ec.haxx.se/usingcurl/usingcurl-proxies#http_proxy-in-lower-case-only

@@ -9,7 +9,7 @@ interface IOkCancelButtonGroupProps {
   readonly className?: string
 
   /**
-   * Does the affirmitive (Ok) button perform a destructive action? This controls
+   * Does the affirmative (Ok) button perform a destructive action? This controls
    * whether the Ok button, or the Cancel button will be the default button,
    * defaults to false.
    */
@@ -20,6 +20,9 @@ interface IOkCancelButtonGroupProps {
 
   /** An optional title (i.e. tooltip) for the Ok button, defaults to none */
   readonly okButtonTitle?: string
+
+  /** Aria description of the ok button */
+  readonly okButtonAriaDescribedBy?: string
 
   /**
    * An optional event handler for when the Ok button is clicked (either
@@ -75,13 +78,13 @@ interface IOkCancelButtonGroupProps {
  * See https://www.nngroup.com/articles/ok-cancel-or-cancel-ok/
  *
  * For the purposes of this component Ok and Cancel are
- * abstract concepts indicating an affirmitive answer to a
+ * abstract concepts indicating an affirmative answer to a
  * question posed by a dialog or a dismissal of the dialog.
  * The actual labels for the buttons can be customized to
  * fit the dialog contents.
  *
  * This component also takes care of selecting the appropriate
- * default button depending on whether an affirmitive answer
+ * default button depending on whether an affirmative answer
  * from the user would result in a destructive action or not.
  */
 export class OkCancelButtonGroup extends React.Component<
@@ -104,7 +107,7 @@ export class OkCancelButtonGroup extends React.Component<
     // what gets clicked if the user submits the form using the keyboard.
     //
     // The dialog component, however, will always treat a form submission
-    // as the "affirmitive"/Ok action and a form reset as the cancel action
+    // as the "affirmative"/Ok action and a form reset as the cancel action
     // so we flip the event we actually send to the dialog here.
     if (this.props.destructive === true) {
       event.preventDefault()
@@ -145,6 +148,7 @@ export class OkCancelButtonGroup extends React.Component<
         disabled={this.props.okButtonDisabled}
         tooltip={this.props.okButtonTitle}
         type={this.props.destructive === true ? 'button' : 'submit'}
+        ariaDescribedBy={this.props.okButtonAriaDescribedBy}
       >
         {this.props.okButtonText || 'Ok'}
       </Button>

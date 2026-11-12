@@ -37,7 +37,6 @@ export function gitHubRepoFixture({
   owner,
   name,
   parent,
-  defaultBranch,
   endpoint,
   isPrivate,
 }: IGitHubRepoFixtureOptions): GitHubRepository {
@@ -49,12 +48,11 @@ export function gitHubRepoFixture({
     new Owner(
       owner,
       endpoint !== undefined ? endpoint : getDotComAPIEndpoint(),
-      null
+      id_counter++
     ),
     id_counter++,
     isPrivate !== undefined ? isPrivate : null,
     htmlUrl,
-    defaultBranch || 'master',
     `${htmlUrl}.git`,
     null,
     null,

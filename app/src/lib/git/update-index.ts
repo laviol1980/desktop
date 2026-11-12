@@ -1,6 +1,6 @@
 import { git } from './core'
 import { Repository } from '../../models/repository'
-import { DiffSelectionType } from '../../models/diff'
+import { DiffSelectionType, ITextDiff, ILargeTextDiff } from '../../models/diff'
 import { applyPatchToIndex } from './apply'
 import {
   WorkingDirectoryFileChange,
@@ -56,7 +56,8 @@ interface IUpdateIndexOptions {
 }
 
 /**
- * Updates the index with file contents from the working tree.
+ * Updates the index with file contents from the working tree. This method
+ * is a noop when no paths are provided.
  *
  * @param paths   A list of paths which are to be updated with file contents and
  *                status from the working directory.
@@ -68,7 +69,7 @@ async function updateIndex(
   paths: ReadonlyArray<string>,
   options: IUpdateIndexOptions = {}
 ) {
-  if (!paths.length) {
+  if (paths.length === 0) {
     return
   }
 
@@ -104,10 +105,13 @@ async function updateIndex(
  * Note that prior to stageFiles the index has been completely reset,
  * the job of this function is to set up the index in such a way that it
  * reflects what the user has selected in the app.
+ *
+ * Certified partial diffs preserve restored selections across awaited staging.
  */
 export async function stageFiles(
   repository: Repository,
-  files: ReadonlyArray<WorkingDirectoryFileChange>
+  files: ReadonlyArray<WorkingDirectoryFileChange>,
+  certifiedPartialDiffs?: ReadonlyMap<string, ITextDiff | ILargeTextDiff>
 ): Promise<void> {
   const normal = []
   const oldRenamed = []
@@ -119,9 +123,7 @@ export async function stageFiles(
       normal.push(file.path)
       if (file.status.kind === AppFileStatusKind.Renamed) {
         oldRenamed.push(file.status.oldPath)
-      }
-
-      if (file.status.kind === AppFileStatusKind.Deleted) {
+      } else if (file.status.kind === AppFileStatusKind.Deleted) {
         deletedFiles.push(file.path)
       }
     } else {
@@ -159,16 +161,16 @@ export async function stageFiles(
   // This third step will only happen if we have files that have been marked
   // for deletion. This covers us for files that were blown away in the last
   // updateIndex call
-  if (deletedFiles.length > 0) {
-    await updateIndex(repository, deletedFiles, { forceRemove: true })
-  }
+  await updateIndex(repository, deletedFiles, { forceRemove: true })
 
   // Finally we run through all files that have partial selections.
   // We don't care about renamed or not here since applyPatchToIndex
   // has logic to support that scenario.
-  if (partial.length) {
-    for (const file of partial) {
-      await applyPatchToIndex(repository, file)
-    }
+  for (const file of partial) {
+    await applyPatchToIndex(
+      repository,
+      file,
+      certifiedPartialDiffs?.get(file.id)
+    )
   }
 }

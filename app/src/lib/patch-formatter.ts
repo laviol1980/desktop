@@ -1,6 +1,11 @@
 import { assertNever } from '../lib/fatal-error'
 import { WorkingDirectoryFileChange, AppFileStatusKind } from '../models/status'
-import { DiffLineType, ITextDiff, DiffSelection } from '../models/diff'
+import {
+  DiffLineType,
+  ITextDiff,
+  DiffSelection,
+  ILargeTextDiff,
+} from '../models/diff'
 
 /**
  * Generates a string matching the format of a GNU unified diff header excluding
@@ -123,7 +128,7 @@ function formatHunkHeader(
  */
 export function formatPatch(
   file: WorkingDirectoryFileChange,
-  diff: ITextDiff
+  diff: ITextDiff | ILargeTextDiff
 ): string {
   let patch = ''
 
@@ -186,7 +191,7 @@ export function formatPatch(
         // is concerned which means that we should treat it as if it's still
         // in the old file so we'll convert it to a context line.
         if (line.type === DiffLineType.Delete) {
-          hunkBuf += ` ${line.text.substr(1)}\n`
+          hunkBuf += ` ${line.text.substring(1)}\n`
           oldCount++
           newCount++
         } else {
@@ -241,7 +246,7 @@ export function formatPatch(
  *                    This is used to determine the from and to paths for the
  *                    patch header.
  * @param diff        All the local changes for that file.
- * @param selecction  A selection of lines from the diff object that we want to discard.
+ * @param selection  A selection of lines from the diff object that we want to discard.
  */
 export function formatPatchToDiscardChanges(
   filePath: string,
@@ -275,10 +280,10 @@ export function formatPatchToDiscardChanges(
       } else if (selection.isSelected(absoluteIndex)) {
         // Reverse the change (if it was an added line, treat it as removed and vice versa).
         if (line.type === DiffLineType.Add) {
-          hunkBuf += `-${line.text.substr(1)}\n`
+          hunkBuf += `-${line.text.substring(1)}\n`
           newCount++
         } else if (line.type === DiffLineType.Delete) {
-          hunkBuf += `+${line.text.substr(1)}\n`
+          hunkBuf += `+${line.text.substring(1)}\n`
           oldCount++
         } else {
           assertNever(line.type, `Unsupported line type ${line.type}`)
@@ -291,7 +296,7 @@ export function formatPatchToDiscardChanges(
           // so we just print it untouched on the diff.
           oldCount++
           newCount++
-          hunkBuf += ` ${line.text.substr(1)}\n`
+          hunkBuf += ` ${line.text.substring(1)}\n`
         } else if (line.type === DiffLineType.Delete) {
           // An unselected removed line has no impact on this patch since it's not
           // found on the current working copy of the file, so we can ignore it.

@@ -7,26 +7,21 @@ import { Account } from '../../models/account'
 import { SignInState, SignInStep } from '../../lib/stores'
 import { assertNever } from '../../lib/fatal-error'
 import { Start } from './start'
-import { SignInDotCom } from './sign-in-dot-com'
 import { SignInEnterprise } from './sign-in-enterprise'
 import { ConfigureGit } from './configure-git'
 import { UiView } from '../ui-view'
-import { UsageOptOut } from './usage-opt-out'
-import { Disposable } from 'event-kit'
+import { getGlobalConfigValue } from '../../lib/git'
 
 /** The steps along the Welcome flow. */
 export enum WelcomeStep {
   Start = 'Start',
   SignInToDotComWithBrowser = 'SignInToDotComWithBrowser',
-  SignInToDotCom = 'SignInToDotCom',
   SignInToEnterprise = 'SignInToEnterprise',
   ConfigureGit = 'ConfigureGit',
-  UsageOptOut = 'UsageOptOut',
 }
 
 interface IWelcomeProps {
   readonly dispatcher: Dispatcher
-  readonly optOut: boolean
   readonly accounts: ReadonlyArray<Account>
   readonly signInState: SignInState | null
 }
@@ -42,11 +37,8 @@ interface IWelcomeState {
    */
   readonly exiting: boolean
 
-  /**
-   * Whether or not GitHub.com supports authenticating with username
-   * and password or if we have to enforce the web flow
-   */
-  readonly dotComSupportsBasicAuth: boolean
+  readonly globalUserName?: string
+  readonly globalUserEmail?: string
 }
 
 // Note that we're reusing the welcome illustrations in the crash process, any
@@ -66,15 +58,12 @@ export const WelcomeLeftBottomImageUri = encodePathAsUrl(
 
 /** The Welcome flow. */
 export class Welcome extends React.Component<IWelcomeProps, IWelcomeState> {
-  private dotComSupportsBasicAuthSubscription: Disposable | null = null
-
   public constructor(props: IWelcomeProps) {
     super(props)
 
     this.state = {
       currentStep: WelcomeStep.Start,
       exiting: false,
-      dotComSupportsBasicAuth: props.dispatcher.tryGetDotComSupportsBasicAuth(),
     }
   }
 
@@ -84,22 +73,23 @@ export class Welcome extends React.Component<IWelcomeProps, IWelcomeState> {
 
   public componentDidMount() {
     this.props.dispatcher.recordWelcomeWizardInitiated()
-    this.dotComSupportsBasicAuthSubscription = this.props.dispatcher.onDotComSupportsBasicAuthUpdated(
-      this.onDotComSupportsBasicAuthUpdated
-    )
+    this.refreshGlobalGitAuthorInfo()
   }
 
-  public componentWillUnmount() {
-    if (this.dotComSupportsBasicAuthSubscription !== null) {
-      this.dotComSupportsBasicAuthSubscription.dispose()
-      this.dotComSupportsBasicAuthSubscription = null
-    }
-  }
-
-  private onDotComSupportsBasicAuthUpdated = (
-    dotComSupportsBasicAuth: boolean
-  ) => {
-    this.setState({ dotComSupportsBasicAuth })
+  public refreshGlobalGitAuthorInfo() {
+    Promise.all([
+      getGlobalConfigValue('user.name'),
+      getGlobalConfigValue('user.email'),
+    ])
+      .then(([globalUserName, globalUserEmail]) => {
+        this.setState({
+          globalUserName: globalUserName ?? undefined,
+          globalUserEmail: globalUserEmail ?? undefined,
+        })
+      })
+      .catch(e => {
+        log.error(`[Welcome] error while fetching global user config`, e)
+      })
   }
 
   /**
@@ -108,10 +98,6 @@ export class Welcome extends React.Component<IWelcomeProps, IWelcomeState> {
    * in or enterprise sign in.
    */
   private get inSignInStep() {
-    if (this.state.currentStep === WelcomeStep.SignInToDotCom) {
-      return true
-    }
-
     if (this.state.currentStep === WelcomeStep.SignInToDotComWithBrowser) {
       return true
     }
@@ -183,16 +169,6 @@ export class Welcome extends React.Component<IWelcomeProps, IWelcomeState> {
             advance={this.advanceToStep}
             dispatcher={this.props.dispatcher}
             loadingBrowserAuth={loadingBrowserAuth}
-            dotComSupportsBasicAuth={this.state.dotComSupportsBasicAuth}
-          />
-        )
-
-      case WelcomeStep.SignInToDotCom:
-        return (
-          <SignInDotCom
-            dispatcher={this.props.dispatcher}
-            advance={this.advanceToStep}
-            signInState={signInState}
           />
         )
 
@@ -210,16 +186,9 @@ export class Welcome extends React.Component<IWelcomeProps, IWelcomeState> {
           <ConfigureGit
             advance={this.advanceToStep}
             accounts={this.props.accounts}
-          />
-        )
-
-      case WelcomeStep.UsageOptOut:
-        return (
-          <UsageOptOut
-            dispatcher={this.props.dispatcher}
-            advance={this.advanceToStep}
-            optOut={this.props.optOut}
             done={this.done}
+            globalUserName={this.state.globalUserName}
+            globalUserEmail={this.state.globalUserEmail}
           />
         )
 
@@ -230,10 +199,15 @@ export class Welcome extends React.Component<IWelcomeProps, IWelcomeState> {
 
   private advanceToStep = (step: WelcomeStep) => {
     log.info(`[Welcome] advancing to step: ${step}`)
-    if (step === WelcomeStep.SignInToDotCom) {
-      this.props.dispatcher.beginDotComSignIn()
-    } else if (step === WelcomeStep.SignInToEnterprise) {
+    if (step === WelcomeStep.SignInToEnterprise) {
       this.props.dispatcher.beginEnterpriseSignIn()
+    }
+
+    // Refresh the global user name and email if we're moving to the
+    // ConfigureGit step. This is necessary because the user could theoretically
+    // have changed their global git config while the welcome flow was open.
+    if (step === WelcomeStep.ConfigureGit) {
+      this.refreshGlobalGitAuthorInfo()
     }
 
     this.setState({ currentStep: step })
@@ -258,16 +232,21 @@ export class Welcome extends React.Component<IWelcomeProps, IWelcomeState> {
         <div className="welcome-left">
           <div className="welcome-content">
             {this.getComponentForCurrentStep()}
-            <img className="welcome-graphic-top" src={WelcomeLeftTopImageUri} />
+            <img
+              className="welcome-graphic-top"
+              src={WelcomeLeftTopImageUri}
+              alt=""
+            />
             <img
               className="welcome-graphic-bottom"
               src={WelcomeLeftBottomImageUri}
+              alt=""
             />
           </div>
         </div>
 
         <div className="welcome-right">
-          <img className="welcome-graphic" src={WelcomeRightImageUri} />
+          <img className="welcome-graphic" src={WelcomeRightImageUri} alt="" />
         </div>
       </UiView>
     )

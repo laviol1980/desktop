@@ -1,27 +1,44 @@
 import {
   RepositoriesDatabase,
   IDatabaseGitHubRepository,
-  IDatabaseOwner,
   IDatabaseProtectedBranch,
+  IDatabaseRepository,
+  getOwnerKey,
 } from '../databases/repositories-database'
 import { Owner } from '../../models/owner'
 import {
   GitHubRepository,
   GitHubRepositoryPermission,
 } from '../../models/github-repository'
-import { Repository } from '../../models/repository'
-import { fatalError } from '../fatal-error'
-import { IAPIRepository, IAPIBranch, IAPIRepositoryPermissions } from '../api'
+import {
+  Repository,
+  RepositoryWithGitHubRepository,
+  isRepositoryWithGitHubRepository,
+  getRepositoryAccountIdentity,
+} from '../../models/repository'
+import { fatalError, assertNonNullable, forceUnwrap } from '../fatal-error'
+import {
+  IAPIRepository,
+  IAPIBranch,
+  IAPIFullRepository,
+  GitHubAccountType,
+} from '../api'
 import { TypedBaseStore } from './base-store'
 import { WorkflowPreferences } from '../../models/workflow-preferences'
 import { clearTagsToPush } from './helpers/tags-to-push-storage'
+import { IMatchedGitHubRepository } from '../repository-matching'
+import { shallowEquals } from '../equality'
+import { Account, IAccountIdentity, isSameAccount } from '../../models/account'
+import { caseInsensitiveEquals } from '../compare'
+
+type AddRepositoryOptions = {
+  missing?: boolean
+}
 
 /** The store for local repositories. */
 export class RepositoriesStore extends TypedBaseStore<
   ReadonlyArray<Repository>
 > {
-  private db: RepositoriesDatabase
-
   // Key-repo ID, Value-date
   private lastStashCheckCache = new Map<number, number>()
 
@@ -37,64 +54,166 @@ export class RepositoriesStore extends TypedBaseStore<
    */
   private protectionEnabledForBranchCache = new Map<string, boolean>()
 
-  public constructor(db: RepositoriesDatabase) {
-    super()
+  private emitQueued = false
 
-    this.db = db
+  /** Incremented whenever an update is requested, see `emitUpdatedRepositories`. */
+  private updateVersion = 0
+
+  public constructor(private readonly db: RepositoriesDatabase) {
+    super()
   }
 
-  /** Find the matching GitHub repository or add it if it doesn't exist. */
+  /**
+   * Insert or update the GitHub repository database record based on the
+   * provided API information and the fetching account's login.
+   */
   public async upsertGitHubRepository(
     endpoint: string,
+    apiRepository: IAPIFullRepository,
+    accountLogin = ''
+  ): Promise<GitHubRepository> {
+    return this.db.transaction(
+      'rw',
+      this.db.gitHubRepositories,
+      this.db.owners,
+      () =>
+        this._upsertGitHubRepository(
+          endpoint,
+          apiRepository,
+          false,
+          accountLogin
+        )
+    )
+  }
+
+  /** Store PR head/base metadata under the fetching repository's account. */
+  public async upsertGitHubRepositoryLightForRepository(
+    context: GitHubRepository,
     apiRepository: IAPIRepository
   ): Promise<GitHubRepository> {
     return this.db.transaction(
       'rw',
-      this.db.repositories,
       this.db.gitHubRepositories,
       this.db.owners,
       async () => {
-        const gitHubRepository = await this.db.gitHubRepositories
-          .where('cloneURL')
-          .equals(apiRepository.clone_url)
-          .limit(1)
-          .first()
-
-        if (gitHubRepository == null) {
-          return this.putGitHubRepository(endpoint, apiRepository)
-        } else {
-          return this.buildGitHubRepository(gitHubRepository)
-        }
+        const record = await this.db.gitHubRepositories.get(context.dbID)
+        assertNonNullable(record, 'Missing repository account context')
+        return this._upsertGitHubRepository(
+          context.endpoint,
+          apiRepository,
+          true,
+          record.accountLogin ?? ''
+        )
       }
     )
   }
 
-  private async buildGitHubRepository(
-    dbRepo: IDatabaseGitHubRepository
+  /**
+   * Resolve metadata for another account without copying permissions, PRs,
+   * branch protections, or refresh dates from the previous account.
+   */
+  private async getGitHubRepositoryForAccount(
+    id: number,
+    login: string | null
   ): Promise<GitHubRepository> {
-    const owner = await this.db.owners.get(dbRepo.ownerID)
-
-    if (owner == null) {
-      throw new Error(`Couldn't find repository owner ${dbRepo.ownerID}`)
+    const record = await this.db.gitHubRepositories.get(id)
+    assertNonNullable(
+      record,
+      'Missing GitHub repository during account assignment'
+    )
+    const accountLogin = login?.toLowerCase() ?? ''
+    if ((record.accountLogin ?? '') === accountLogin) {
+      return this.toGitHubRepository(record)
     }
 
-    let parent: GitHubRepository | null = null
-    if (dbRepo.parentID) {
-      parent = await this.findGitHubRepositoryByID(dbRepo.parentID)
+    const existing = await this.db.gitHubRepositories
+      .where('[ownerID+name+accountLogin]')
+      .equals([record.ownerID, record.name, accountLogin])
+      .first()
+    if (existing !== undefined) {
+      return this.toGitHubRepository(existing)
     }
 
-    return new GitHubRepository(
-      dbRepo.name,
-      new Owner(owner.login, owner.endpoint, owner.id!),
-      dbRepo.id!,
-      dbRepo.private,
-      dbRepo.htmlURL,
-      dbRepo.defaultBranch,
-      dbRepo.cloneURL,
-      dbRepo.issuesEnabled,
-      dbRepo.isArchived,
-      dbRepo.permissions,
+    const parent =
+      record.parentID === null
+        ? null
+        : await this.getGitHubRepositoryForAccount(record.parentID, login)
+    const scopedRecord: IDatabaseGitHubRepository = {
+      ...record,
+      id: undefined,
+      accountLogin,
+      parentID: parent?.dbID ?? null,
+      permissions: null,
+      lastPruneDate: null,
+    }
+    const scopedID = await this.db.gitHubRepositories.add(scopedRecord)
+    return this.toGitHubRepository(
+      { ...scopedRecord, id: scopedID },
+      undefined,
       parent
+    )
+  }
+
+  private async toGitHubRepository(
+    repo: IDatabaseGitHubRepository,
+    owner?: Owner,
+    parent?: GitHubRepository | null
+  ): Promise<GitHubRepository> {
+    assertNonNullable(repo.id, 'Need db id to create GitHubRepository')
+
+    // Note the difference between parent being null and undefined. Null means
+    // that the caller explicitly wants us to initialize a GitHubRepository
+    // without a parent, undefined means we should try to dig it up.
+    if (parent === undefined && repo.parentID !== null) {
+      const dbParent = await this.db.gitHubRepositories.get(repo.parentID)
+      assertNonNullable(dbParent, `Missing parent '${repo.id}'`)
+      parent = await this.toGitHubRepository(dbParent)
+    }
+
+    if (owner === undefined) {
+      const dbOwner = await this.db.owners.get(repo.ownerID)
+      assertNonNullable(dbOwner, `Missing owner '${repo.ownerID}'`)
+      owner = new Owner(
+        dbOwner.login,
+        dbOwner.endpoint,
+        dbOwner.id!,
+        dbOwner.type
+      )
+    }
+
+    const ghRepo = new GitHubRepository(
+      repo.name,
+      owner,
+      repo.id,
+      repo.private,
+      repo.htmlURL,
+      repo.cloneURL,
+      repo.issuesEnabled,
+      repo.isArchived,
+      repo.permissions,
+      parent
+    )
+
+    // Dexie gets confused if we return a non-promise value (e.g. if this function
+    // didn't need to await for the parent repo or the owner)
+    return Promise.resolve(ghRepo)
+  }
+
+  private async toRepository(repo: IDatabaseRepository) {
+    assertNonNullable(repo.id, "can't convert to Repository without id")
+    return new Repository(
+      repo.path,
+      repo.id,
+      repo.gitHubRepositoryID !== null
+        ? await this.findGitHubRepositoryByID(repo.gitHubRepositoryID)
+        : await Promise.resolve(null), // Dexie gets confused if we return null
+      repo.missing,
+      repo.alias,
+      repo.workflowPreferences,
+      repo.isTutorialRepository,
+      repo.gitDir,
+      repo.mainWorktreePath,
+      repo.login ?? null
     )
   }
 
@@ -103,11 +222,9 @@ export class RepositoriesStore extends TypedBaseStore<
     id: number
   ): Promise<GitHubRepository | null> {
     const gitHubRepository = await this.db.gitHubRepositories.get(id)
-    if (!gitHubRepository) {
-      return null
-    }
-
-    return this.buildGitHubRepository(gitHubRepository)
+    return gitHubRepository !== undefined
+      ? this.toGitHubRepository(gitHubRepository)
+      : Promise.resolve(null) // Dexie gets confused if we return null
   }
 
   /** Get all the local repositories. */
@@ -118,48 +235,28 @@ export class RepositoriesStore extends TypedBaseStore<
       this.db.gitHubRepositories,
       this.db.owners,
       async () => {
-        const inflatedRepos = new Array<Repository>()
-        const repos = await this.db.repositories.toArray()
-        for (const repo of repos) {
-          let inflatedRepo: Repository | null = null
-          let gitHubRepository: GitHubRepository | null = null
-          if (repo.gitHubRepositoryID) {
-            gitHubRepository = await this.findGitHubRepositoryByID(
-              repo.gitHubRepositoryID
-            )
-          }
+        const repos = new Array<Repository>()
 
-          inflatedRepo = new Repository(
-            repo.path,
-            repo.id!,
-            gitHubRepository,
-            repo.missing,
-            repo.workflowPreferences,
-            repo.isTutorialRepository
-          )
-          inflatedRepos.push(inflatedRepo)
+        for (const dbRepo of await this.db.repositories.toArray()) {
+          assertNonNullable(dbRepo.id, 'no id after loading from db')
+          repos.push(await this.toRepository(dbRepo))
         }
 
-        return inflatedRepos
+        return repos
       }
     )
   }
 
   /**
-   * Add a tutorial repository.
+   * Assign legacy repositories once, using the accounts persisted at startup.
    *
-   * This method differs from the `addRepository` method in that it
-   * requires that the repository has been created on the remote and
-   * set up to track it. Given that tutorial repositories are created
-   * from the no-repositories blank slate it shouldn't be possible for
-   * another repository with the same path to exist but in case that
-   * changes in the future this method will set the tutorial flag on
-   * the existing repository at the given path.
+   * Pass every persisted identity, not just the accounts whose credentials
+   * loaded, so a locked keychain doesn't permanently unassign repositories.
+   * Persisting null also marks a record as migrated. Newly added repositories
+   * start with null, so signing in later never implicitly assigns them.
    */
-  public async addTutorialRepository(
-    path: string,
-    endpoint: string,
-    apiRepository: IAPIRepository
+  public async migrateAccountAssignments(
+    accounts: ReadonlyArray<IAccountIdentity>
   ) {
     await this.db.transaction(
       'rw',
@@ -167,25 +264,139 @@ export class RepositoriesStore extends TypedBaseStore<
       this.db.gitHubRepositories,
       this.db.owners,
       async () => {
-        const gitHubRepository = await this.upsertGitHubRepository(
-          endpoint,
-          apiRepository
-        )
+        for (const record of await this.db.repositories.toArray()) {
+          if (record.login !== undefined) {
+            continue
+          }
+          assertNonNullable(record.id, 'Missing repository id during migration')
+          const repository = await this.toRepository(record)
+          const account = accounts.find(
+            a => a.endpoint === repository.gitHubRepository?.endpoint
+          )
+          const login = account?.login ?? null
+          const ghRepo =
+            record.gitHubRepositoryID === null
+              ? null
+              : await this.getGitHubRepositoryForAccount(
+                  record.gitHubRepositoryID,
+                  login
+                )
+          await this.db.repositories.update(record.id, {
+            login,
+            gitHubRepositoryID: ghRepo?.dbID ?? null,
+          })
+        }
+      }
+    )
+    this.emitUpdatedRepositories()
+  }
 
+  /** Persist an explicit assignment and return the current repository. */
+  public async updateRepositoryAccount(
+    repository: Repository,
+    login: string | null
+  ): Promise<Repository> {
+    const updated = await this.db.transaction(
+      'rw',
+      this.db.repositories,
+      this.db.gitHubRepositories,
+      this.db.owners,
+      async () => {
+        const record = await this.db.repositories.get(repository.id)
+        assertNonNullable(
+          record,
+          'Cannot assign an account to a missing repository'
+        )
+        const ghRepo =
+          record.gitHubRepositoryID === null
+            ? null
+            : await this.getGitHubRepositoryForAccount(
+                record.gitHubRepositoryID,
+                login
+              )
+        const updatedRecord = {
+          ...record,
+          login,
+          gitHubRepositoryID: ghRepo?.dbID ?? null,
+        }
+        await this.db.repositories.put(updatedRecord)
+        return this.toRepository(updatedRecord)
+      }
+    )
+    this.emitUpdatedRepositories()
+    return updated
+  }
+
+  /** Clear assignments only when explicitly requested during sign-out. */
+  public async clearAccountAssignments(account: Account): Promise<void> {
+    await this.db.transaction(
+      'rw',
+      this.db.repositories,
+      this.db.gitHubRepositories,
+      this.db.owners,
+      async () => {
+        for (const repository of await this.getAll()) {
+          if (
+            isSameAccount(account, getRepositoryAccountIdentity(repository))
+          ) {
+            await this.updateRepositoryAccount(repository, null)
+          }
+        }
+      }
+    )
+    this.emitUpdatedRepositories()
+  }
+
+  /**
+   * Add a tutorial repository.
+   *
+   * This method differs from the `addRepository` method in that it requires
+   * that the repository has been created on the remote and set up to track it.
+   * Given that tutorial repositories are created from the no-repositories blank
+   * slate it shouldn't be possible for another repository with the same path to
+   * exist but in case that changes in the future this method will set the
+   * tutorial flag on the existing repository at the given path, preserving
+   * its assignment and metadata. New repositories store the fetching account's
+   * login together with account-scoped metadata.
+   */
+  public async addTutorialRepository(
+    path: string,
+    endpoint: string,
+    apiRepo: IAPIFullRepository,
+    gitDir?: string,
+    accountLogin?: string
+  ) {
+    await this.db.transaction(
+      'rw',
+      this.db.repositories,
+      this.db.gitHubRepositories,
+      this.db.owners,
+      async () => {
         const existingRepo = await this.db.repositories.get({ path })
-        const existingRepoId =
-          existingRepo && existingRepo.id !== null ? existingRepo.id : undefined
-
-        return await this.db.repositories.put(
-          {
-            path,
-            gitHubRepositoryID: gitHubRepository.dbID,
-            missing: false,
-            lastStashCheckDate: null,
+        if (existingRepo !== undefined) {
+          assertNonNullable(existingRepo.id, 'Missing tutorial repository id')
+          await this.db.repositories.update(existingRepo.id, {
             isTutorialRepository: true,
-          },
-          existingRepoId
+          })
+          return
+        }
+
+        const ghRepo = await this.upsertGitHubRepository(
+          endpoint,
+          apiRepo,
+          accountLogin
         )
+
+        await this.db.repositories.add({
+          path,
+          alias: null,
+          gitHubRepositoryID: ghRepo.dbID,
+          missing: false,
+          lastStashCheckDate: null,
+          isTutorialRepository: true,
+          login: accountLogin ?? null,
+          gitDir,
+        })
       }
     )
 
@@ -197,36 +408,34 @@ export class RepositoriesStore extends TypedBaseStore<
    *
    * If a repository already exists with that path, it will be returned instead.
    */
-  public async addRepository(path: string): Promise<Repository> {
+  public async addRepository(
+    path: string,
+    gitDir: string | undefined,
+    opts?: AddRepositoryOptions
+  ): Promise<Repository> {
     const repository = await this.db.transaction(
       'rw',
       this.db.repositories,
       this.db.gitHubRepositories,
       this.db.owners,
       async () => {
-        const repos = await this.db.repositories.toArray()
-        const record = repos.find(r => r.path === path)
-        let recordId: number
-        let gitHubRepo: GitHubRepository | null = null
+        const existing = await this.db.repositories.get({ path })
 
-        if (record != null) {
-          recordId = record.id!
-
-          if (record.gitHubRepositoryID != null) {
-            gitHubRepo = await this.findGitHubRepositoryByID(
-              record.gitHubRepositoryID
-            )
-          }
-        } else {
-          recordId = await this.db.repositories.add({
-            path,
-            gitHubRepositoryID: null,
-            missing: false,
-            lastStashCheckDate: null,
-          })
+        if (existing !== undefined) {
+          return await this.toRepository(existing)
         }
 
-        return new Repository(path, recordId, gitHubRepo, false)
+        const dbRepo: IDatabaseRepository = {
+          path,
+          gitHubRepositoryID: null,
+          missing: opts?.missing ?? false,
+          lastStashCheckDate: null,
+          alias: null,
+          login: null,
+          gitDir,
+        }
+        const id = await this.db.repositories.add(dbRepo)
+        return this.toRepository({ id, ...dbRepo })
       }
     )
 
@@ -248,76 +457,157 @@ export class RepositoriesStore extends TypedBaseStore<
     repository: Repository,
     missing: boolean
   ): Promise<Repository> {
-    const repoID = repository.id
-    if (!repoID) {
-      return fatalError(
-        '`updateRepositoryMissing` can only update `missing` for a repository which has been added to the database.'
-      )
-    }
+    return this.updateRepositoryRecord(repository, { missing })
+  }
 
-    await this.db.repositories.update(repoID, { missing })
+  /** Update the repository's `gitDir` path. */
+  public async updateRepositoryGitDir(
+    repository: Repository,
+    gitDir: string
+  ): Promise<Repository> {
+    return this.updateRepositoryRecord(repository, { gitDir })
+  }
+
+  /**
+   * Update the alias for the specified repository.
+   *
+   * @param repository  The repository to update.
+   * @param alias       The new alias to use.
+   */
+  public async updateRepositoryAlias(
+    repository: Repository,
+    alias: string | null
+  ): Promise<void> {
+    await this.db.repositories.update(repository.id, { alias })
 
     this.emitUpdatedRepositories()
-
-    return new Repository(
-      repository.path,
-      repository.id,
-      repository.gitHubRepository,
-      missing,
-      repository.workflowPreferences,
-      repository.isTutorialRepository
-    )
   }
 
   /**
    * Update the workflow preferences for the specified repository.
    *
-   * @param repository            The repositosy to update.
+   * @param repository            The repository to update.
    * @param workflowPreferences   The object with the workflow settings to use.
    */
   public async updateRepositoryWorkflowPreferences(
     repository: Repository,
     workflowPreferences: WorkflowPreferences
   ): Promise<void> {
-    const repoID = repository.id
-
-    if (!repoID) {
-      return fatalError(
-        '`updateRepositoryWorkflowPreferences` can only update `workflowPreferences` for a repository which has been added to the database.'
-      )
-    }
-
-    await this.db.repositories.update(repoID, { workflowPreferences })
+    await this.db.repositories.update(repository.id, { workflowPreferences })
 
     this.emitUpdatedRepositories()
   }
 
-  /** Update the repository's path. */
+  /**
+   * Update the repository's path.
+   *
+   * Unlike `switchWorktree` this doesn't default `mainWorktreePath` to the
+   * recorded one. Moving a repository invalidates it, so callers say what it is
+   * now, or `undefined` when it can't be resolved.
+   */
   public async updateRepositoryPath(
     repository: Repository,
-    path: string
+    path: string,
+    gitDir: string | undefined,
+    mainWorktreePath: string | undefined,
+    missing: boolean = false
   ): Promise<Repository> {
-    const repoID = repository.id
-    if (!repoID) {
-      return fatalError(
-        '`updateRepositoryPath` can only update the path for a repository which has been added to the database.'
-      )
+    return this.updateRepositoryRecord(repository, {
+      missing,
+      path,
+      gitDir,
+      mainWorktreePath,
+    })
+  }
+
+  /**
+   * Switch the repository to a different worktree path, persisting the target
+   * git directory as a stable anchor for recovery.
+   *
+   * If another repository already exists at the target path, returns that
+   * repository instead of modifying the current one.
+   *
+   * @param repository  The repository to switch
+   * @param worktreePath The path of the worktree to switch to
+   * @param gitDir       The git directory for the target worktree
+   * @param mainWorktreePath The path of the repository's main worktree, which
+   *                         recovery relies on once the target worktree (and
+   *                         its git metadata) is gone
+   */
+  public async switchWorktree(
+    repository: Repository,
+    worktreePath: string,
+    missing = false,
+    gitDir: string | undefined = repository.gitDir,
+    mainWorktreePath: string | undefined = repository.mainWorktreePath
+  ): Promise<{ repository: Repository; existingRepository: boolean }> {
+    const existing = await this.db.repositories.get({ path: worktreePath })
+
+    if (existing !== undefined) {
+      return {
+        repository: await this.toRepository(existing),
+        existingRepository: true,
+      }
     }
 
-    await this.db.repositories.update(repoID, {
-      missing: false,
-      path,
-    })
+    return {
+      repository: await this.updateRepositoryRecord(repository, {
+        path: worktreePath,
+        missing,
+        gitDir,
+        mainWorktreePath,
+      }),
+      existingRepository: false,
+    }
+  }
+
+  /**
+   * Update fields of the repository's record and return the current
+   * repository.
+   *
+   * The account or GitHub repository may have changed since the caller got
+   * its repository, so the result is read from the database rather than
+   * derived from the given repository.
+   */
+  private async updateRepositoryRecord(
+    repository: Repository,
+    changes: Partial<
+      Pick<
+        IDatabaseRepository,
+        'missing' | 'path' | 'gitDir' | 'mainWorktreePath'
+      >
+    >
+  ): Promise<Repository> {
+    const updated = await this.db.transaction(
+      'rw',
+      this.db.repositories,
+      this.db.gitHubRepositories,
+      this.db.owners,
+      async () => {
+        await this.db.repositories.update(repository.id, changes)
+        const record = await this.db.repositories.get(repository.id)
+        return record === undefined ? undefined : this.toRepository(record)
+      }
+    )
 
     this.emitUpdatedRepositories()
 
-    return new Repository(
-      path,
-      repository.id,
-      repository.gitHubRepository,
-      false,
-      repository.workflowPreferences,
-      repository.isTutorialRepository
+    return (
+      updated ??
+      new Repository(
+        changes.path ?? repository.path,
+        repository.id,
+        repository.gitHubRepository,
+        changes.missing ?? repository.missing,
+        repository.alias,
+        repository.workflowPreferences,
+        repository.isTutorialRepository,
+        'gitDir' in changes ? changes.gitDir : repository.gitDir,
+        'mainWorktreePath' in changes
+          ? changes.mainWorktreePath
+          : repository.mainWorktreePath,
+        repository.login
+      )
     )
   }
 
@@ -332,18 +622,11 @@ export class RepositoriesStore extends TypedBaseStore<
     repository: Repository,
     date: number = Date.now()
   ): Promise<void> {
-    const repoID = repository.id
-    if (repoID === 0) {
-      return fatalError(
-        '`updateLastStashCheckDate` can only update the last stash check date for a repository which has been added to the database.'
-      )
-    }
-
-    await this.db.repositories.update(repoID, {
+    await this.db.repositories.update(repository.id, {
       lastStashCheckDate: date,
     })
 
-    this.lastStashCheckCache.set(repoID, date)
+    this.lastStashCheckCache.set(repository.id, date)
 
     // this update doesn't affect the list (or its items) we emit from this store, so no need to `emitUpdatedRepositories`
   }
@@ -356,161 +639,290 @@ export class RepositoriesStore extends TypedBaseStore<
   public async getLastStashCheckDate(
     repository: Repository
   ): Promise<number | null> {
-    const repoID = repository.id
-    if (!repoID) {
-      return fatalError(
-        '`getLastStashCheckDate` - can only retrieve the last stash check date for a repositories that have been stored in the database.'
-      )
-    }
-
-    let lastCheckDate = this.lastStashCheckCache.get(repoID) || null
+    let lastCheckDate = this.lastStashCheckCache.get(repository.id) || null
     if (lastCheckDate !== null) {
       return lastCheckDate
     }
 
-    const record = await this.db.repositories.get(repoID)
+    const record = await this.db.repositories.get(repository.id)
 
     if (record === undefined) {
       return fatalError(
-        `'getLastStashCheckDate' - unable to find repository with ID: ${repoID}`
+        `'getLastStashCheckDate' - unable to find repository with ID: ${repository.id}`
       )
     }
 
-    lastCheckDate = record.lastStashCheckDate
+    lastCheckDate = record.lastStashCheckDate ?? null
     if (lastCheckDate !== null) {
-      this.lastStashCheckCache.set(repoID, lastCheckDate)
+      this.lastStashCheckCache.set(repository.id, lastCheckDate)
     }
 
     return lastCheckDate
   }
 
-  private async putOwner(endpoint: string, login: string): Promise<Owner> {
-    login = login.toLowerCase()
+  private async putOwner(
+    endpoint: string,
+    login: string,
+    ownerType?: GitHubAccountType
+  ): Promise<Owner> {
+    const key = getOwnerKey(endpoint, login)
+    const existingOwner = await this.db.owners.get({ key })
+    let id
 
-    const existingOwner = await this.db.owners
-      .where('[endpoint+login]')
-      .equals([endpoint, login])
-      .first()
-    if (existingOwner) {
-      return new Owner(login, endpoint, existingOwner.id!)
+    // Since we look up the owner based on a key which is the product of the
+    // lowercased endpoint and login we know that we've found our match but it's
+    // possible that the case differs (i.e we found `usera` but the actual login
+    // is `userA`). In that case we want to update our database to persist the
+    // login with the proper case.
+    if (
+      existingOwner === undefined ||
+      existingOwner.login !== login ||
+      // This is added so that we update existing owners with an undefined type.
+      (ownerType !== undefined && existingOwner.type !== ownerType)
+    ) {
+      id = existingOwner?.id
+      const existingId = id !== undefined ? { id } : {}
+      id = await this.db.owners.put({
+        ...existingId,
+        key,
+        endpoint,
+        login,
+        type: ownerType,
+      })
+    } else {
+      id = forceUnwrap('Missing owner id', existingOwner.id)
     }
 
-    const dbOwner: IDatabaseOwner = {
-      login,
-      endpoint,
-    }
-    const id = await this.db.owners.add(dbOwner)
-    return new Owner(login, endpoint, id)
+    return new Owner(login, endpoint, id, ownerType ?? existingOwner?.type)
   }
 
-  private async putGitHubRepository(
-    endpoint: string,
-    gitHubRepository: IAPIRepository
-  ): Promise<GitHubRepository> {
-    let parent: GitHubRepository | null = null
-    if (gitHubRepository.parent) {
-      parent = await this.putGitHubRepository(endpoint, gitHubRepository.parent)
-    }
+  public async upsertGitHubRepositoryFromMatch(
+    match: IMatchedGitHubRepository
+  ) {
+    return await this.db.transaction(
+      'rw',
+      this.db.gitHubRepositories,
+      this.db.owners,
+      async () => {
+        const { account } = match
+        const owner = await this.putOwner(account.endpoint, match.owner)
+        const existingRepo = await this.db.gitHubRepositories
+          .where('[ownerID+name+accountLogin]')
+          .equals([owner.id, match.name, account.login.toLowerCase()])
+          .first()
 
-    const login = gitHubRepository.owner.login.toLowerCase()
-    const owner = await this.putOwner(endpoint, login)
+        if (existingRepo) {
+          return this.toGitHubRepository(existingRepo, owner)
+        }
 
-    const existingRepo = await this.db.gitHubRepositories
-      .where('[ownerID+name]')
-      .equals([owner.id!, gitHubRepository.name])
-      .first()
+        const skeletonRepo: IDatabaseGitHubRepository = {
+          cloneURL: null,
+          htmlURL: null,
+          lastPruneDate: null,
+          name: match.name,
+          ownerID: owner.id,
+          parentID: null,
+          private: null,
+          accountLogin: account.login.toLowerCase(),
+        }
 
-    // If we can't resolve permissions for the current repository
-    // chances are that it's because it's the parent repository of
-    // another repository and we ended up here because the "actual"
-    // repository is trying to upsert its parent. Since parent
-    // repository hashes don't include a permissions hash and since
-    // it's possible that the user has both the fork and the parent
-    // repositories in the app we don't want to overwrite the permissions
-    // hash in the parent repository if we can help it or else we'll
-    // end up in a perpetual race condition where updating the fork
-    // will clear the permissions on the parent and updating the parent
-    // will reinstate them.
-    const permissions =
-      getPermissionsString(gitHubRepository.permissions) ||
-      (existingRepo ? existingRepo.permissions : undefined)
-
-    let updatedGitHubRepo: IDatabaseGitHubRepository = {
-      ownerID: owner.id!,
-      name: gitHubRepository.name,
-      private: gitHubRepository.private,
-      htmlURL: gitHubRepository.html_url,
-      defaultBranch: gitHubRepository.default_branch,
-      cloneURL: gitHubRepository.clone_url,
-      parentID: parent ? parent.dbID : null,
-      lastPruneDate: null,
-      issuesEnabled: gitHubRepository.has_issues,
-      isArchived: gitHubRepository.archived,
-      permissions,
-    }
-    if (existingRepo) {
-      updatedGitHubRepo = { ...updatedGitHubRepo, id: existingRepo.id }
-    }
-
-    const id = await this.db.gitHubRepositories.put(updatedGitHubRepo)
-    return new GitHubRepository(
-      updatedGitHubRepo.name,
-      owner,
-      id,
-      updatedGitHubRepo.private,
-      updatedGitHubRepo.htmlURL,
-      updatedGitHubRepo.defaultBranch,
-      updatedGitHubRepo.cloneURL,
-      updatedGitHubRepo.issuesEnabled,
-      updatedGitHubRepo.isArchived,
-      updatedGitHubRepo.permissions,
-      parent
+        const id = await this.db.gitHubRepositories.put(skeletonRepo)
+        return this.toGitHubRepository({ ...skeletonRepo, id }, owner, null)
+      }
     )
   }
 
-  /** Add or update the repository's GitHub repository. */
-  public async updateGitHubRepository(
-    repository: Repository,
-    endpoint: string,
-    gitHubRepository: IAPIRepository
-  ): Promise<Repository> {
-    const repoID = repository.id
-    if (!repoID) {
-      return fatalError(
-        '`updateGitHubRepository` can only update a GitHub repository for a repository which has been added to the database.'
-      )
-    }
-
-    const updatedGitHubRepo = await this.db.transaction(
+  /**
+   * Clear a remote association and account assignment, unless either has changed
+   * since the caller's snapshot.
+   */
+  public async clearGitHubRepository(repo: Repository): Promise<Repository> {
+    const { updatedRepo, changed } = await this.db.transaction(
       'rw',
       this.db.repositories,
       this.db.gitHubRepositories,
       this.db.owners,
       async () => {
-        const localRepo = (await this.db.repositories.get(repoID))!
-        const updatedGitHubRepo = await this.putGitHubRepository(
-          endpoint,
-          gitHubRepository
-        )
-
-        await this.db.repositories.update(localRepo.id!, {
-          gitHubRepositoryID: updatedGitHubRepo.dbID,
-        })
-
-        return updatedGitHubRepo
+        const record = await this.db.repositories.get(repo.id)
+        assertNonNullable(record, 'Cannot clear a missing repository')
+        if (
+          !hasCurrentAssociation(record, repo) ||
+          (record.gitHubRepositoryID === null && record.login === null)
+        ) {
+          return {
+            updatedRepo: await this.toRepository(record),
+            changed: false,
+          }
+        }
+        const updated = {
+          ...record,
+          gitHubRepositoryID: null,
+          login: null,
+        }
+        await this.db.repositories.put(updated)
+        return {
+          updatedRepo: await this.toRepository(updated),
+          changed: true,
+        }
       }
     )
+    if (changed) {
+      this.emitUpdatedRepositories()
+    }
+    return updatedRepo
+  }
 
-    this.emitUpdatedRepositories()
-
-    return new Repository(
-      repository.path,
-      repository.id,
-      updatedGitHubRepo,
-      repository.missing,
-      repository.workflowPreferences,
-      repository.isTutorialRepository
+  /**
+   * Attach account-scoped metadata unless the caller's association is stale.
+   * Returns the current repository, which may have been disassociated meanwhile.
+   *
+   * @param assignLogin When provided, also assign this account (or none, for
+   *                    null) in the same step, so no intermediate GitHub
+   *                    repository record is created for the current account.
+   */
+  public async setGitHubRepository(
+    repo: Repository,
+    ghRepo: GitHubRepository,
+    assignLogin?: string | null
+  ): Promise<Repository> {
+    const { updatedRepo, changed } = await this.db.transaction(
+      'rw',
+      this.db.repositories,
+      this.db.gitHubRepositories,
+      this.db.owners,
+      async () => {
+        const record = await this.db.repositories.get(repo.id)
+        assertNonNullable(record, 'Cannot update a missing repository')
+        const current = await this.toRepository(record)
+        // An API request started before an account switch must not replace
+        // the new account's metadata (or restore its old remote).
+        if (!hasCurrentAssociation(record, repo)) {
+          return { updatedRepo: current, changed: false }
+        }
+        const login =
+          assignLogin !== undefined
+            ? assignLogin
+            : current.gitHubRepository !== null &&
+              !caseInsensitiveEquals(
+                current.gitHubRepository.endpoint,
+                ghRepo.endpoint
+              )
+            ? null
+            : current.login
+        const scoped = await this.getGitHubRepositoryForAccount(
+          ghRepo.dbID,
+          login
+        )
+        if (
+          isRepositoryWithGitHubRepository(current) &&
+          current.gitHubRepository.hash === scoped.hash &&
+          current.login === login
+        ) {
+          return { updatedRepo: current, changed: false }
+        }
+        const updated = { ...record, login, gitHubRepositoryID: scoped.dbID }
+        await this.db.repositories.put(updated)
+        return {
+          updatedRepo: await this.toRepository(updated),
+          changed: true,
+        }
+      }
     )
+    if (changed) {
+      this.emitUpdatedRepositories()
+    }
+
+    return updatedRepo
+  }
+
+  private async _upsertGitHubRepository(
+    endpoint: string,
+    gitHubRepository: IAPIRepository | IAPIFullRepository,
+    ignoreParent = false,
+    accountLogin = ''
+  ): Promise<GitHubRepository> {
+    const parent =
+      'parent' in gitHubRepository && gitHubRepository.parent !== undefined
+        ? await this._upsertGitHubRepository(
+            endpoint,
+            gitHubRepository.parent,
+            true,
+            accountLogin
+          )
+        : await Promise.resolve(null) // Dexie gets confused if we return null
+
+    const { login, type } = gitHubRepository.owner
+    const owner = await this.putOwner(endpoint, login, type)
+
+    const existingRepo = await this.db.gitHubRepositories
+      .where('[ownerID+name+accountLogin]')
+      .equals([owner.id, gitHubRepository.name, accountLogin.toLowerCase()])
+      .first()
+
+    // If we can't resolve permissions for the current repository chances are
+    // that it's because it's the parent repository of another repository and we
+    // ended up here because the "actual" repository is trying to upsert its
+    // parent. Since parent repository hashes don't include a permissions hash
+    // and since it's possible that the user has both the fork and the parent
+    // repositories in the app we don't want to overwrite the permissions hash
+    // in the parent repository if we can help it or else we'll end up in a
+    // perpetual race condition where updating the fork will clear the
+    // permissions on the parent and updating the parent will reinstate them.
+    const permissions =
+      'permissions' in gitHubRepository &&
+      gitHubRepository.permissions !== undefined
+        ? getPermissionsString(gitHubRepository)
+        : existingRepo?.permissions
+
+    // If we're told to ignore the parent then we'll attempt to use the existing
+    // parent and if that fails set it to null. This happens when we want to
+    // ensure we have a GitHubRepository record but we acquired the API data for
+    // said repository from an API endpoint that doesn't include the parent
+    // property like when loading pull requests. Similarly even when retrieving
+    // a full API repository its parent won't be a full repo so we'll never know
+    // if the parent of a repository has a parent (confusing, right?)
+    //
+    // We do all this to ensure that we only set the parent to null when we know
+    // that it needs to be cleared. Otherwise we could have a scenario where
+    // we've got a repository network where C is a fork of B and B is a fork of
+    // A which is the root. If we attempt to upsert C without these checks in
+    // place we'd wipe our knowledge of B being a fork of A.
+    //
+    // Since going from having a parent to not having a parent is incredibly
+    // rare (deleting a forked repository and creating it from scratch again
+    // with the same name or the parent getting deleted, etc) we assume that the
+    // value we've got is valid until we're certain its not.
+    const parentID = ignoreParent
+      ? existingRepo?.parentID ?? null
+      : parent?.dbID ?? null
+
+    const updatedGitHubRepo: IDatabaseGitHubRepository = {
+      ...(existingRepo?.id !== undefined && { id: existingRepo.id }),
+      ownerID: owner.id,
+      accountLogin: accountLogin.toLowerCase(),
+      name: gitHubRepository.name,
+      private: gitHubRepository.private,
+      htmlURL: gitHubRepository.html_url,
+      cloneURL: gitHubRepository.clone_url,
+      parentID,
+      lastPruneDate: existingRepo?.lastPruneDate ?? null,
+      issuesEnabled: gitHubRepository.has_issues,
+      isArchived: gitHubRepository.archived,
+      permissions,
+    }
+
+    if (existingRepo !== undefined) {
+      // If nothing has changed since the last time we persisted the API info
+      // we can skip writing to the database and (more importantly) avoid
+      // telling store consumers that the repo store has changed.
+      if (shallowEquals(existingRepo, updatedGitHubRepo)) {
+        return this.toGitHubRepository(existingRepo, owner, parent)
+      }
+    }
+
+    const id = await this.db.gitHubRepositories.put(updatedGitHubRepo)
+    this.emitUpdatedRepositories()
+    return this.toGitHubRepository({ ...updatedGitHubRepo, id }, owner, parent)
   }
 
   /** Add or update the branch protections associated with a GitHub repository. */
@@ -519,17 +931,12 @@ export class RepositoriesStore extends TypedBaseStore<
     protectedBranches: ReadonlyArray<IAPIBranch>
   ): Promise<void> {
     const dbID = gitHubRepository.dbID
-    if (!dbID) {
-      return fatalError(
-        '`updateBranchProtections` can only update a GitHub repository for a repository which has been added to the database.'
-      )
-    }
 
     await this.db.transaction('rw', this.db.protectedBranches, async () => {
       // This update flow is organized into two stages:
       //
       // - update the in-memory cache
-      // - update the underyling database state
+      // - update the underlying database state
       //
       // This should ensure any stale values are not being used, and avoids
       // the need to query the database while the results are in memory.
@@ -544,10 +951,7 @@ export class RepositoriesStore extends TypedBaseStore<
       }
 
       const branchRecords = protectedBranches.map<IDatabaseProtectedBranch>(
-        b => ({
-          repoId: dbID,
-          name: b.name,
-        })
+        b => ({ repoId: dbID, name: b.name })
       )
 
       // update cached values to avoid database lookup
@@ -576,31 +980,10 @@ export class RepositoriesStore extends TypedBaseStore<
    * @param date The date and time in which the last prune took place
    */
   public async updateLastPruneDate(
-    repository: Repository,
+    repository: RepositoryWithGitHubRepository,
     date: number
   ): Promise<void> {
-    const repoID = repository.id
-    if (repoID === 0) {
-      return fatalError(
-        '`updateLastPruneDate` can only update the last prune date for a repository which has been added to the database.'
-      )
-    }
-
-    const githubRepo = repository.gitHubRepository
-    if (githubRepo === null) {
-      return fatalError(
-        `'updateLastPruneDate' can only update GitHub repositories`
-      )
-    }
-
-    const gitHubRepositoryID = githubRepo.dbID
-    if (gitHubRepositoryID === null) {
-      return fatalError(
-        `'updateLastPruneDate' can only update GitHub repositories with a valid ID: received ID of ${gitHubRepositoryID}`
-      )
-    }
-
-    await this.db.gitHubRepositories.update(gitHubRepositoryID, {
+    await this.db.gitHubRepositories.update(repository.gitHubRepository.dbID, {
       lastPruneDate: date,
     })
 
@@ -608,38 +991,16 @@ export class RepositoriesStore extends TypedBaseStore<
   }
 
   public async getLastPruneDate(
-    repository: Repository
+    repository: RepositoryWithGitHubRepository
   ): Promise<number | null> {
-    const repoID = repository.id
-    if (!repoID) {
-      return fatalError(
-        '`getLastPruneDate` - can only retrieve the last prune date for a repositories that have been stored in the database.'
-      )
-    }
-
-    const githubRepo = repository.gitHubRepository
-    if (githubRepo === null) {
-      return fatalError(
-        `'getLastPruneDate' - can only retrieve the last prune date for GitHub repositories.`
-      )
-    }
-
-    const gitHubRepositoryID = githubRepo.dbID
-    if (gitHubRepositoryID === null) {
-      return fatalError(
-        `'getLastPruneDate' - can only retrieve the last prune date for GitHub repositories that have been stored in the database.`
-      )
-    }
-
-    const record = await this.db.gitHubRepositories.get(gitHubRepositoryID)
+    const id = repository.gitHubRepository.dbID
+    const record = await this.db.gitHubRepositories.get(id)
 
     if (record === undefined) {
-      return fatalError(
-        `'getLastPruneDate' - unable to find GitHub repository with ID: ${gitHubRepositoryID}`
-      )
+      return fatalError(`getLastPruneDate: No such GitHub repository: ${id}`)
     }
 
-    return record!.lastPruneDate
+    return record.lastPruneDate
   }
 
   /**
@@ -672,19 +1033,12 @@ export class RepositoriesStore extends TypedBaseStore<
   public async hasBranchProtectionsConfigured(
     gitHubRepository: GitHubRepository
   ): Promise<boolean> {
-    if (gitHubRepository.dbID === null) {
-      return fatalError(
-        'unable to get protected branches, GitHub repository has a null dbID'
-      )
-    }
-
-    const { dbID } = gitHubRepository
     const branchProtectionsFound = this.branchProtectionSettingsFoundCache.get(
-      dbID
+      gitHubRepository.dbID
     )
 
     if (branchProtectionsFound === undefined) {
-      return this.loadAndCacheBranchProtection(dbID)
+      return this.loadAndCacheBranchProtection(gitHubRepository.dbID)
     }
 
     return branchProtectionsFound
@@ -693,10 +1047,47 @@ export class RepositoriesStore extends TypedBaseStore<
   /**
    * Helper method to emit updates consistently
    * (This is the only way we emit updates from this store.)
+   *
+   * The repositories are read asynchronously, so another update may be made
+   * while they're being read. The read is retried in that case, so listeners
+   * never receive repositories older than ones a caller already got back.
    */
-  private async emitUpdatedRepositories() {
-    this.emitUpdate(await this.getAll())
+  private emitUpdatedRepositories() {
+    this.updateVersion++
+    if (!this.emitQueued) {
+      this.emitQueued = true
+      setImmediate(() => this.emitLatestRepositories())
+    }
   }
+
+  private async emitLatestRepositories() {
+    try {
+      let version
+      let repositories
+      do {
+        version = this.updateVersion
+        repositories = await this.getAll()
+      } while (version !== this.updateVersion)
+
+      this.emitQueued = false
+      this.emitUpdate(repositories)
+    } catch (e) {
+      this.emitQueued = false
+      log.error(`Failed emitting update`, e)
+    }
+  }
+}
+
+/** Whether an asynchronous caller still holds the current account and remote. */
+function hasCurrentAssociation(
+  record: IDatabaseRepository,
+  repository: Repository
+) {
+  return (
+    (record.login?.toLowerCase() ?? null) ===
+      (repository.login?.toLowerCase() ?? null) &&
+    record.gitHubRepositoryID === (repository.gitHubRepository?.dbID ?? null)
+  )
 }
 
 /** Compute the key for the branch protection cache */
@@ -710,9 +1101,11 @@ function getKeyPrefix(dbID: number) {
 }
 
 function getPermissionsString(
-  permissions: IAPIRepositoryPermissions | undefined
+  repo: IAPIRepository | IAPIFullRepository
 ): GitHubRepositoryPermission {
-  if (!permissions) {
+  const permissions = 'permissions' in repo ? repo.permissions : undefined
+
+  if (permissions === undefined) {
     return null
   } else if (permissions.admin) {
     return 'admin'

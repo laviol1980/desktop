@@ -8,6 +8,8 @@ import {
   WorkingDirectoryFileChange,
   CommittedFileChange,
 } from '../../models/status'
+import { DiffHunk, DiffHunkExpansionType } from '../../models/diff/raw-diff'
+import { DiffLineType, ILargeTextDiff, ITextDiff } from '../../models/diff'
 
 /**
  * DiffRowType defines the different types of
@@ -26,6 +28,13 @@ export enum DiffRowType {
   Modified = 'Modified',
 }
 
+export enum DiffColumn {
+  Before = 'before',
+  After = 'after',
+}
+
+export type SimplifiedDiffRowData = Omit<IDiffRowData, 'isSelected'>
+
 export interface IDiffRowData {
   /**
    * The actual contents of the diff line.
@@ -38,11 +47,10 @@ export interface IDiffRowData {
   readonly lineNumber: number
 
   /**
-   * The line number on the diff.
-   * This is used for discarding lines
-   * and for partial committing lines.
+   * The line number on the original diff (without expansion).
+   * This is used for discarding lines and for partial committing lines.
    */
-  readonly diffLineNumber: number
+  readonly diffLineNumber: number | null
 
   /**
    * Flag to display that this diff line lacks a new line.
@@ -65,13 +73,13 @@ export interface IDiffRowData {
 /**
  * IDiffRowAdded represents a row that displays an added line.
  */
-interface IDiffRowAdded {
+interface IDiffRowAdded<T = IDiffRowData> {
   readonly type: DiffRowType.Added
 
   /**
    * The data object contains information about that added line in the diff.
    */
-  readonly data: IDiffRowData
+  readonly data: T
 
   /**
    * The start line of the hunk where this line belongs in the diff.
@@ -86,13 +94,13 @@ interface IDiffRowAdded {
 /**
  * IDiffRowDeleted represents a row that displays a deleted line.
  */
-interface IDiffRowDeleted {
+interface IDiffRowDeleted<T = IDiffRowData> {
   readonly type: DiffRowType.Deleted
 
   /**
    * The data object contains information about that deleted line in the diff.
    */
-  readonly data: IDiffRowData
+  readonly data: T
 
   /**
    * The start line of the hunk where this line belongs in the diff.
@@ -108,18 +116,18 @@ interface IDiffRowDeleted {
  * IDiffRowModified represents a row that displays both a deleted line inline
  * with an added line.
  */
-interface IDiffRowModified {
+interface IDiffRowModified<T = IDiffRowData> {
   readonly type: DiffRowType.Modified
 
   /**
    * The beforeData object contains information about the deleted line in the diff.
    */
-  readonly beforeData: IDiffRowData
+  readonly beforeData: T
 
   /**
    * The beforeData object contains information about the added line in the diff.
    */
-  readonly afterData: IDiffRowData
+  readonly afterData: T
 
   /**
    * The start line of the hunk where this line belongs in the diff.
@@ -154,15 +162,14 @@ interface IDiffRowContext {
   readonly afterLineNumber: number
 
   /**
-   * Tokens to use to syntax highlight the contents of the line.
-   *
-   * TODO: It would be more resiliant to have separate tokens for the
-   * before version and the after one, since the syntax highlighting
-   * depends on previous lines. That's currently not possible because an
-   * optimization done in getLineFilters() that avoids calculating
-   * the syntax highlighting of the after state of context lines.
+   * Tokens to use to syntax highlight the contents of the before version of the line.
    */
-  readonly tokens: ReadonlyArray<ILineTokens>
+  readonly beforeTokens: ReadonlyArray<ILineTokens>
+
+  /**
+   * Tokens to use to syntax highlight the contents of the after version of the line.
+   */
+  readonly afterTokens: ReadonlyArray<ILineTokens>
 }
 
 /**
@@ -175,6 +182,12 @@ interface IDiffRowHunk {
    * The actual contents of the line.
    */
   readonly content: string
+
+  /** How the hunk can be expanded. */
+  readonly expansionType: DiffHunkExpansionType
+
+  /** Index of the hunk in the diff. */
+  readonly hunkIndex: number
 }
 
 export type DiffRow =
@@ -184,7 +197,29 @@ export type DiffRow =
   | IDiffRowContext
   | IDiffRowHunk
 
+export type SimplifiedDiffRow =
+  | IDiffRowAdded<SimplifiedDiffRowData>
+  | IDiffRowDeleted<SimplifiedDiffRowData>
+  | IDiffRowModified<SimplifiedDiffRowData>
+  | IDiffRowContext
+  | IDiffRowHunk
+
 export type ChangedFile = WorkingDirectoryFileChange | CommittedFileChange
+
+/**
+ * Whether the row is a type that represent a change (added, deleted, modified)
+ * in the diff. This is useful for checking to see if a row type would have
+ * something like 'hunkStartLine` on it.
+ */
+export function isRowChanged(
+  row: DiffRow | SimplifiedDiffRow
+): row is IDiffRowAdded | IDiffRowDeleted | IDiffRowModified {
+  return (
+    row.type === DiffRowType.Added ||
+    row.type === DiffRowType.Deleted ||
+    row.type === DiffRowType.Modified
+  )
+}
 
 /**
  * Returns an object with two ILineTokens objects that can be used to highlight
@@ -332,4 +367,113 @@ export function canSelect(
   file: ChangedFile
 ): file is WorkingDirectoryFileChange {
   return file instanceof WorkingDirectoryFileChange
+}
+
+/** Gets the width in pixels of the diff line number gutter based on the number of digits in the number */
+export function getLineWidthFromDigitCount(digitAmount: number): number {
+  return Math.max(digitAmount, 3) * 10 + 5
+}
+
+/** Utility function for getting the digit count of the largest line number in an array of diff hunks */
+export function getLargestLineNumber(hunks: DiffHunk[]): number {
+  if (hunks.length === 0) {
+    return 0
+  }
+
+  for (let i = hunks.length - 1; i >= 0; i--) {
+    const hunk = hunks[i]
+
+    for (let j = hunk.lines.length - 1; j >= 0; j--) {
+      const line = hunk.lines[j]
+
+      if (line.type === DiffLineType.Hunk) {
+        continue
+      }
+
+      const newLineNumber = line.newLineNumber ?? 0
+      const oldLineNumber = line.oldLineNumber ?? 0
+      return newLineNumber > oldLineNumber ? newLineNumber : oldLineNumber
+    }
+  }
+
+  return 0
+}
+
+export function getNumberOfDigits(val: number): number {
+  return (Math.log(val) * Math.LOG10E + 1) | 0
+}
+
+/**
+ * The longest line for which we'd try to calculate a line diff, this matches
+ * GitHub.com's behavior.
+ **/
+export const MaxIntraLineDiffStringLength = 1024
+
+/**
+ * Used to obtain classes applied to style the row as first or last of a group
+ * of added or deleted rows in the side-by-side diff.
+ **/
+export function getFirstAndLastClassesSideBySide(
+  row: SimplifiedDiffRow,
+  previousRow: SimplifiedDiffRow | undefined,
+  nextRow: SimplifiedDiffRow | undefined,
+  addedOrDeleted: DiffRowType.Added | DiffRowType.Deleted
+): ReadonlyArray<string> {
+  const classes = new Array<string>()
+  const typesToCheck = [addedOrDeleted, DiffRowType.Modified]
+
+  // Is the row of the type we are checking? No. Then can't be first or last.
+  if (!typesToCheck.includes(row.type)) {
+    return []
+  }
+
+  // Is the previous row exist or is of the type we are checking?
+  // No. Then this row must be the first of this type.
+  if (previousRow === undefined || !typesToCheck.includes(previousRow.type)) {
+    classes.push('is-first')
+  }
+
+  // Is the next row exist or is of the type we are checking?
+  // No. Then this row must be last of this type.
+  if (nextRow === undefined || !typesToCheck.includes(nextRow.type)) {
+    classes.push('is-last')
+  }
+
+  return classes
+}
+
+/**
+ * Compares two text diffs for structural equality.
+ *
+ * Components needing to know whether a re-render is necessary after receiving
+ * a diff is the intended use case.
+ */
+export function textDiffEquals(
+  x: ITextDiff | ILargeTextDiff,
+  y: ITextDiff | ILargeTextDiff
+) {
+  if (x === y) {
+    return true
+  }
+
+  if (
+    x.text === y.text &&
+    x.kind === y.kind &&
+    x.hasHiddenBidiChars === y.hasHiddenBidiChars &&
+    x.lineEndingsChange === y.lineEndingsChange &&
+    x.hunks.length === y.hunks.length
+  ) {
+    // This is a performance optimization which lets us avoid iterating over all
+    // lines (deep equality on all hunks). We're already comparing the diff text
+    // above so the only thing that can change with the diff text staying the
+    // same is whether or not the last line is followed by a trailing newline.
+    // That information is encodeded in the noTrailingNewLine property which
+    // exists on all lines but is only ever set on lines in the last hunk
+    return (
+      x.hunks.length === 0 ||
+      x.hunks[x.hunks.length - 1].equals(y.hunks[y.hunks.length - 1])
+    )
+  }
+
+  return false
 }

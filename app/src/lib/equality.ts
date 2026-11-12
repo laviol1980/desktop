@@ -42,10 +42,7 @@ export function shallowEquals(x: any, y: any) {
 
   for (let i = 0; i < xKeys.length; i++) {
     const key = xKeys[i]
-    if (
-      !Object.prototype.hasOwnProperty.call(y, key) ||
-      !Object.is(x[key], y[key])
-    ) {
+    if (!Object.hasOwn(y, key) || !Object.is(x[key], y[key])) {
       return false
     }
   }
@@ -95,12 +92,6 @@ export function mapKeysEqual<T>(x: Map<T, unknown>, y: Map<T, unknown>) {
 
   for (const key of x.keys()) {
     if (!y.has(key)) {
-      return false
-    }
-  }
-
-  for (const key of y.keys()) {
-    if (!x.has(key)) {
       return false
     }
   }
